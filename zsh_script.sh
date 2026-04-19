@@ -1,204 +1,236 @@
-#!/bin/sh
+#!/usr/bin/env sh
+set -eu
 
-# Try to auto-install dependencies via common package managers.
-install_deps() {
-    os_name="$(uname -s 2>/dev/null || echo unknown)"
-    is_linux=0
-    if [ "$os_name" = "Linux" ]; then
-        is_linux=1
+STATE_FILE="${HOME}/.zsh_setup_state"
+ZSH_DIR="${ZSH:-${HOME}/.oh-my-zsh}"
+ZSH_CUSTOM_DIR="${ZSH_CUSTOM:-${ZSH_DIR}/custom}"
+ZSHRC="${ZDOTDIR:-${HOME}}/.zshrc"
+BACKUP_ZSHRC="${ZSHRC}.pre-zsh-setup.bak"
+
+CORE_PLUGINS="git sudo colored-man-pages history-substring-search zsh-autosuggestions zsh-syntax-highlighting"
+OPTIONAL_PLUGIN_FZF="fzf"
+OPTIONAL_PLUGIN_CMD_NOT_FOUND="command-not-found"
+
+log() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'Warning: %s\n' "$*" >&2
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+os_name() {
+    uname -s 2>/dev/null || printf 'unknown\n'
+}
+
+pkg_manager() {
+    if have brew; then printf 'brew\n'; return; fi
+    if have nala; then printf 'nala\n'; return; fi
+    if have apt-get; then printf 'apt-get\n'; return; fi
+    if have dnf; then printf 'dnf\n'; return; fi
+    if have pacman; then printf 'pacman\n'; return; fi
+    if have zypper; then printf 'zypper\n'; return; fi
+    if have apk; then printf 'apk\n'; return; fi
+    printf 'unknown\n'
+}
+
+install_packages() {
+    pm="$(pkg_manager)"
+    case "$pm" in
+        brew)
+            brew install git curl zsh fzf
+            ;;
+        nala)
+            sudo nala update
+            sudo nala install -y git curl zsh fzf
+            ;;
+        apt-get)
+            sudo apt-get update
+            sudo apt-get install -y git curl zsh fzf
+            ;;
+        dnf)
+            sudo dnf install -y git curl zsh fzf
+            ;;
+        pacman)
+            sudo pacman -Syu --noconfirm git curl zsh fzf
+            ;;
+        zypper)
+            sudo zypper refresh
+            sudo zypper install -y git curl zsh fzf
+            ;;
+        apk)
+            sudo apk add git curl zsh fzf
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+ensure_dependencies() {
+    missing=0
+    for cmd in git curl zsh; do
+        if ! have "$cmd"; then
+            missing=1
+        fi
+    done
+
+    if [ "$missing" -eq 1 ] || ! have fzf; then
+        log "Installing required packages and optional fzf support..."
+        if ! install_packages; then
+            warn "No supported package manager found. Install git, curl, and zsh manually."
+            exit 1
+        fi
+    fi
+}
+
+get_shell_path() {
+    if have zsh; then
+        command -v zsh
+        return
     fi
 
-    if [ "$is_linux" -eq 1 ]; then
-        if command -v apt >/dev/null 2>&1; then
-            sudo apt update && sudo apt install -y curl git zsh
-            return $?
+    for p in /bin/zsh /usr/bin/zsh /usr/local/bin/zsh /opt/homebrew/bin/zsh; do
+        if [ -x "$p" ]; then
+            printf '%s\n' "$p"
+            return
         fi
-        if command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y curl git zsh
-            return $?
-        fi
-        if command -v pacman >/dev/null 2>&1; then
-            sudo pacman -Syu --noconfirm curl git zsh
-            return $?
-        fi
-        if command -v yay >/dev/null 2>&1; then
-            yay -Syu --noconfirm curl git zsh
-            return $?
-        fi
-        if command -v paru >/dev/null 2>&1; then
-            paru -Syu --noconfirm curl git zsh
-            return $?
-        fi
-        if command -v brew >/dev/null 2>&1; then
-            brew install curl git zsh
-            return $?
-        fi
-        return 1
-    fi
+    done
 
-    if command -v brew >/dev/null 2>&1; then
-        brew install curl git zsh
-        return $?
-    fi
     return 1
 }
 
-need_cmd() {
-    if ! command -v "$1" >/dev/null 2>&1; then
-        missing=1
+current_login_shell() {
+    if have getent && [ -n "${USER:-}" ]; then
+        getent passwd "$USER" | awk -F: '{print $7}'
+        return
+    fi
+
+    if [ "$(os_name)" = "Darwin" ] && [ -n "${USER:-}" ]; then
+        dscl . -read "/Users/$USER" UserShell 2>/dev/null | awk '{print $2}'
+        return
+    fi
+
+    printf '%s\n' "${SHELL:-}"
+}
+
+shell_in_etc_shells() {
+    shell_path="$1"
+    [ -r /etc/shells ] || return 1
+    grep -Fx "$shell_path" /etc/shells >/dev/null 2>&1
+}
+
+set_login_shell_if_safe() {
+    target_shell="$1"
+    original_shell="$2"
+
+    [ -n "$target_shell" ] || return 0
+    [ "$original_shell" = "$target_shell" ] && return 0
+
+    if ! have chsh; then
+        warn "chsh is not available. Leaving login shell unchanged."
+        return 0
+    fi
+
+    if ! shell_in_etc_shells "$target_shell"; then
+        warn "$target_shell is not listed in /etc/shells. Leaving login shell unchanged."
+        return 0
+    fi
+
+    if chsh -s "$target_shell"; then
+        log "Login shell changed to $target_shell"
+    else
+        warn "Unable to change login shell automatically."
     fi
 }
 
-STATE_FILE="$HOME/.codex_zsh_setup_state"
-ZSHRC="${ZDOTDIR:-$HOME}/.zshrc"
-ZSH_CUSTOM_DIR="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
-had_zshrc=0
-if [ -f "$ZSHRC" ]; then
-    had_zshrc=1
-fi
-
-if [ "${1:-}" = "--uninstall" ]; then
-    if [ -f "$STATE_FILE" ]; then
-        # shellcheck disable=SC1090
-        . "$STATE_FILE"
+backup_zshrc_once() {
+    if [ -f "$ZSHRC" ] && [ ! -f "$BACKUP_ZSHRC" ]; then
+        cp "$ZSHRC" "$BACKUP_ZSHRC"
     fi
+}
 
-    if [ -f "$ZSHRC.codex-zsh-setup.bak" ]; then
-        mv "$ZSHRC.codex-zsh-setup.bak" "$ZSHRC"
+install_oh_my_zsh() {
+    installed_ohmyzsh=0
+    if [ ! -d "$ZSH_DIR" ]; then
+        installed_ohmyzsh=1
+        RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
     fi
-
-    if [ "${INSTALLED_ZSH_SYNTAX_HIGHLIGHTING:-0}" = "1" ]; then
-        rm -rf "$ZSH_CUSTOM_DIR/plugins/zsh-syntax-highlighting"
-    fi
-    if [ "${INSTALLED_ZSH_AUTOSUGGESTIONS:-0}" = "1" ]; then
-        rm -rf "$ZSH_CUSTOM_DIR/plugins/zsh-autosuggestions"
-    fi
-    if [ "${INSTALLED_HISTORY_SUBSTRING_SEARCH:-0}" = "1" ]; then
-        rm -rf "$ZSH_CUSTOM_DIR/plugins/history-substring-search"
-    fi
-
-    if [ "${INSTALLED_OHMYZSH:-0}" = "1" ]; then
-        rm -rf "$HOME/.oh-my-zsh"
-    fi
-
-    if command -v chsh >/dev/null 2>&1; then
-        if [ -n "${ORIGINAL_SHELL:-}" ]; then
-            chsh -s "$ORIGINAL_SHELL"
-        else
-            printf '%s\n' "Original shell not recorded; please change your login shell manually."
-        fi
-    else
-        printf '%s\n' "chsh not found; please change your login shell manually."
-    fi
-
-    rm -f "$STATE_FILE"
-    printf '%s\n' "Uninstall complete."
-    exit 0
-fi
-
-missing=0
-need_cmd curl
-need_cmd git
-need_cmd zsh
-
-original_shell=""
-if command -v getent >/dev/null 2>&1; then
-    original_shell="$(getent passwd "$USER" | cut -d: -f7)"
-fi
-if [ -z "$original_shell" ]; then
-    original_shell="${SHELL:-}"
-fi
-
-if [ "$missing" -ne 0 ]; then
-    printf '%s\n' "Attempting to install missing dependencies (curl, git, zsh)..."
-    if ! install_deps; then
-        printf '%s\n' "No supported package manager found. Please install curl, git, and zsh manually."
-        exit 1
-    fi
-fi
-
-# Backup existing .zshrc before Oh My Zsh can modify it.
-if [ "$had_zshrc" -eq 1 ] && [ ! -f "$ZSHRC.codex-zsh-setup.bak" ]; then
-    cp "$ZSHRC" "$ZSHRC.codex-zsh-setup.bak"
-fi
-
-# Install Oh My Zsh
-installed_ohmyzsh=0
-if [ ! -d "$HOME/.oh-my-zsh" ]; then
-    installed_ohmyzsh=1
-    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
-fi
-
-# Clone plugins that require downloads
+    printf '%s\n' "$installed_ohmyzsh"
+}
 
 clone_plugin() {
     repo="$1"
     name="$2"
-    target="$ZSH_CUSTOM_DIR/plugins/$name"
+    target="${ZSH_CUSTOM_DIR}/plugins/${name}"
+
     if [ ! -d "$target" ]; then
-        git clone "$repo" "$target"
+        git clone --depth=1 "$repo" "$target"
+        return 0
+    fi
+    return 1
+}
+
+install_custom_plugins() {
+    installed_zsh_syntax_highlighting=0
+    installed_zsh_autosuggestions=0
+    installed_history_substring_search=0
+
+    if clone_plugin "https://github.com/zsh-users/zsh-syntax-highlighting.git" "zsh-syntax-highlighting"; then
+        installed_zsh_syntax_highlighting=1
+    fi
+    if clone_plugin "https://github.com/zsh-users/zsh-autosuggestions.git" "zsh-autosuggestions"; then
+        installed_zsh_autosuggestions=1
+    fi
+    if clone_plugin "https://github.com/zsh-users/zsh-history-substring-search.git" "history-substring-search"; then
+        installed_history_substring_search=1
+    fi
+
+    printf '%s:%s:%s\n' \
+        "$installed_zsh_syntax_highlighting" \
+        "$installed_zsh_autosuggestions" \
+        "$installed_history_substring_search"
+}
+
+build_plugin_list() {
+    plugins="$CORE_PLUGINS"
+
+    if have fzf; then
+        plugins="$plugins $OPTIONAL_PLUGIN_FZF"
+    fi
+
+    case "$(pkg_manager)" in
+        nala|apt-get)
+            plugins="$plugins $OPTIONAL_PLUGIN_CMD_NOT_FOUND"
+            ;;
+    esac
+
+    printf '%s\n' "$plugins"
+}
+
+create_base_zshrc_if_missing() {
+    if [ ! -f "$ZSHRC" ]; then
+        cat > "$ZSHRC" <<EOF2
+export ZSH="${ZSH_DIR}"
+ZSH_THEME="robbyrussell"
+plugins=()
+source "${ZSH_DIR}/oh-my-zsh.sh"
+EOF2
     fi
 }
 
-INSTALLED_ZSH_SYNTAX_HIGHLIGHTING=0
-INSTALLED_ZSH_AUTOSUGGESTIONS=0
-INSTALLED_HISTORY_SUBSTRING_SEARCH=0
+rewrite_plugins_line() {
+    desired_plugins="$1"
+    tmpfile="$(mktemp "${TMPDIR:-/tmp}/zshrc.XXXXXX")"
 
-if [ ! -d "$ZSH_CUSTOM_DIR/plugins/zsh-syntax-highlighting" ]; then
-    clone_plugin "https://github.com/zsh-users/zsh-syntax-highlighting.git" "zsh-syntax-highlighting"
-    if [ -d "$ZSH_CUSTOM_DIR/plugins/zsh-syntax-highlighting" ]; then
-        INSTALLED_ZSH_SYNTAX_HIGHLIGHTING=1
-    fi
-fi
-if [ ! -d "$ZSH_CUSTOM_DIR/plugins/zsh-autosuggestions" ]; then
-    clone_plugin "https://github.com/zsh-users/zsh-autosuggestions.git" "zsh-autosuggestions"
-    if [ -d "$ZSH_CUSTOM_DIR/plugins/zsh-autosuggestions" ]; then
-        INSTALLED_ZSH_AUTOSUGGESTIONS=1
-    fi
-fi
-if [ ! -d "$ZSH_CUSTOM_DIR/plugins/history-substring-search" ]; then
-    clone_plugin "https://github.com/zsh-users/zsh-history-substring-search.git" "history-substring-search"
-    if [ -d "$ZSH_CUSTOM_DIR/plugins/history-substring-search" ]; then
-        INSTALLED_HISTORY_SUBSTRING_SEARCH=1
-    fi
-fi
-
-# Add plugins to .zshrc (portable, no in-place sed)
-if [ -f "$ZSHRC" ]; then
-    source_rc="$ZSHRC"
-    if [ "$had_zshrc" -eq 1 ] && [ ! -f "$ZSHRC.codex-zsh-setup.bak" ]; then
-        cp "$ZSHRC" "$ZSHRC.codex-zsh-setup.bak"
-        source_rc="$ZSHRC.codex-zsh-setup.bak"
-    fi
-    tmpfile="$(mktemp "${TMPDIR:-/tmp}/zshrc.XXXXXX")" || exit 1
-    awk '
-        function has_plugin(name, n, i) {
-            for (i = 1; i <= n; i++) {
-                if (plugins[i] == name) {
-                    return 1
-                }
-            }
-            return 0
-        }
+    awk -v desired_plugins="$desired_plugins" '
         BEGIN { replaced=0 }
         /^[[:space:]]*plugins=\(/ {
-            line=$0
-            sub(/^[[:space:]]*plugins=\(/, "", line)
-            sub(/\).*/, "", line)
-            n=split(line, plugins, /[[:space:]]+/)
-            req_count=split("git zsh-syntax-highlighting zsh-autosuggestions history-substring-search colored-man-pages command-not-found sudo fzf", req, /[[:space:]]+/)
-            out=""
-            for (i=1; i<=n; i++) {
-                if (plugins[i] != "" && !has_plugin(plugins[i], i-1)) {
-                    out = (out == "" ? plugins[i] : out " " plugins[i])
-                }
-            }
-            for (i=1; i<=req_count; i++) {
-                if (!has_plugin(req[i], n)) {
-                    out = (out == "" ? req[i] : out " " req[i])
-                }
-            }
-            print "plugins=(" out ")"
+            print "plugins=(" desired_plugins ")"
             replaced=1
             next
         }
@@ -206,20 +238,126 @@ if [ -f "$ZSHRC" ]; then
         END {
             if (replaced == 0) {
                 print ""
-                print "plugins=(git zsh-syntax-highlighting zsh-autosuggestions history-substring-search colored-man-pages command-not-found sudo fzf)"
+                print "plugins=(" desired_plugins ")"
             }
         }
-    ' "$source_rc" > "$tmpfile" && mv "$tmpfile" "$ZSHRC"
-else
-    printf '%s\n' "No .zshrc found at $ZSHRC; please add plugins manually."
-fi
+    ' "$ZSHRC" > "$tmpfile"
 
-{
-    printf '%s\n' "INSTALLED_OHMYZSH=$installed_ohmyzsh"
-    printf '%s\n' "INSTALLED_ZSH_SYNTAX_HIGHLIGHTING=$INSTALLED_ZSH_SYNTAX_HIGHLIGHTING"
-    printf '%s\n' "INSTALLED_ZSH_AUTOSUGGESTIONS=$INSTALLED_ZSH_AUTOSUGGESTIONS"
-    printf '%s\n' "INSTALLED_HISTORY_SUBSTRING_SEARCH=$INSTALLED_HISTORY_SUBSTRING_SEARCH"
-    printf '%s\n' "ORIGINAL_SHELL=$original_shell"
-} > "$STATE_FILE"
+    mv "$tmpfile" "$ZSHRC"
+}
 
-printf '%s\n' "Done. Restart your shell or run: exec zsh"
+ensure_line_once() {
+    line="$1"
+    if ! grep -Fqx "$line" "$ZSHRC" 2>/dev/null; then
+        printf '%s\n' "$line" >> "$ZSHRC"
+    fi
+}
+
+setup_fzf_shell_integration() {
+    if ! have fzf; then
+        return 0
+    fi
+
+    if have brew; then
+        fzf_prefix="$(brew --prefix 2>/dev/null)/opt/fzf"
+        if [ -f "$fzf_prefix/shell/completion.zsh" ]; then
+            ensure_line_once "[ -f \"$fzf_prefix/shell/completion.zsh\" ] && source \"$fzf_prefix/shell/completion.zsh\""
+        fi
+        if [ -f "$fzf_prefix/shell/key-bindings.zsh" ]; then
+            ensure_line_once "[ -f \"$fzf_prefix/shell/key-bindings.zsh\" ] && source \"$fzf_prefix/shell/key-bindings.zsh\""
+        fi
+        return 0
+    fi
+
+    for base in /usr/share/fzf /usr/share/doc/fzf/examples /usr/share/fzf-shell /usr/local/opt/fzf/shell; do
+        if [ -f "$base/completion.zsh" ]; then
+            ensure_line_once "[ -f \"$base/completion.zsh\" ] && source \"$base/completion.zsh\""
+            break
+        fi
+    done
+
+    for base in /usr/share/fzf /usr/share/doc/fzf/examples /usr/share/fzf-shell /usr/local/opt/fzf/shell; do
+        if [ -f "$base/key-bindings.zsh" ]; then
+            ensure_line_once "[ -f \"$base/key-bindings.zsh\" ] && source \"$base/key-bindings.zsh\""
+            break
+        fi
+    done
+}
+
+write_state() {
+    installed_ohmyzsh="$1"
+    installed_zsh_syntax_highlighting="$2"
+    installed_zsh_autosuggestions="$3"
+    installed_history_substring_search="$4"
+    original_shell="$5"
+
+    cat > "$STATE_FILE" <<EOF2
+INSTALLED_OHMYZSH=$installed_ohmyzsh
+INSTALLED_ZSH_SYNTAX_HIGHLIGHTING=$installed_zsh_syntax_highlighting
+INSTALLED_ZSH_AUTOSUGGESTIONS=$installed_zsh_autosuggestions
+INSTALLED_HISTORY_SUBSTRING_SEARCH=$installed_history_substring_search
+ORIGINAL_SHELL=$original_shell
+EOF2
+}
+
+uninstall_setup() {
+    if [ -f "$STATE_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$STATE_FILE"
+    fi
+
+    if [ -f "$BACKUP_ZSHRC" ]; then
+        mv "$BACKUP_ZSHRC" "$ZSHRC"
+    fi
+
+    [ "${INSTALLED_ZSH_SYNTAX_HIGHLIGHTING:-0}" = "1" ] && rm -rf "${ZSH_CUSTOM_DIR}/plugins/zsh-syntax-highlighting"
+    [ "${INSTALLED_ZSH_AUTOSUGGESTIONS:-0}" = "1" ] && rm -rf "${ZSH_CUSTOM_DIR}/plugins/zsh-autosuggestions"
+    [ "${INSTALLED_HISTORY_SUBSTRING_SEARCH:-0}" = "1" ] && rm -rf "${ZSH_CUSTOM_DIR}/plugins/history-substring-search"
+    [ "${INSTALLED_OHMYZSH:-0}" = "1" ] && rm -rf "$ZSH_DIR"
+
+    if [ -n "${ORIGINAL_SHELL:-}" ] && have chsh && shell_in_etc_shells "$ORIGINAL_SHELL"; then
+        chsh -s "$ORIGINAL_SHELL" || warn "Failed to restore original login shell automatically."
+    fi
+
+    rm -f "$STATE_FILE"
+    log "Uninstall complete."
+}
+
+main() {
+    if [ "${1:-}" = "--uninstall" ]; then
+        uninstall_setup
+        exit 0
+    fi
+
+    ensure_dependencies
+
+    original_shell="$(current_login_shell)"
+    target_shell="$(get_shell_path || true)"
+
+    backup_zshrc_once
+    create_base_zshrc_if_missing
+
+    installed_ohmyzsh="$(install_oh_my_zsh)"
+
+    plugin_flags="$(install_custom_plugins)"
+    installed_zsh_syntax_highlighting="$(printf '%s' "$plugin_flags" | cut -d: -f1)"
+    installed_zsh_autosuggestions="$(printf '%s' "$plugin_flags" | cut -d: -f2)"
+    installed_history_substring_search="$(printf '%s' "$plugin_flags" | cut -d: -f3)"
+
+    desired_plugins="$(build_plugin_list)"
+    rewrite_plugins_line "$desired_plugins"
+    setup_fzf_shell_integration
+    set_login_shell_if_safe "$target_shell" "$original_shell"
+
+    write_state \
+        "$installed_ohmyzsh" \
+        "$installed_zsh_syntax_highlighting" \
+        "$installed_zsh_autosuggestions" \
+        "$installed_history_substring_search" \
+        "$original_shell"
+
+    log "Done. Restart your shell or run: exec zsh"
+}
+
+main "$@"
+
